@@ -202,5 +202,31 @@ if __name__ == "__main__":
         z2 = z2[peaks2]
         z3 = z3[peaks3]
 
-        outdict[k] = [[z1, ]]
-        
+        outdict[k] = [[z1, z2, z3], [peaks1, peaks2, peaks3]]
+
+    # peaks
+    # groupby on interval, find max zscore
+    #    pvalue: pnorm(max_z)/np.log10
+    #    these are peak.NLP
+    #    peak_loc is just start + end / 2
+    #    need the enrichment there with ((ratio*chip_cvg) + 1) / (bg_cvg + 1)
+    #    also need coverage at peak loc, left and right
+    #    enrichment: 
+
+
+    # true peaks:
+        # find peaks that overlap on forward and reverse strand
+        # join strandedness reverse then new pos union
+
+        # then add flank_distance to peaks
+        # if peak_type == 1:
+        #     new_peaks.Start -= flank_distance
+        #     new_peaks.End += flank_distance
+        # elif peak_type == 2:
+        #     new_peaks.Start -= flank_distance
+        # elif peak_type == 3:
+        #     new_peaks.End += flank_distance
+
+        # then compute their lags with sum_cvg 
+        # then their lags
+
