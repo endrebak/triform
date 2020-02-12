@@ -1,7 +1,9 @@
 import sys
 from setuptools import setup, find_packages
 
-from triform2.version import __version__
+
+__version__ = open("triform2/version.py").readline().split(" = ")[1].replace(
+    '"', '').strip()
 
 install_requires = ["pyranges"]
 
