@@ -93,6 +93,7 @@ read_width = args["read_width"]
 
 max_p = args["max_p"]
 min_width = args["min_width"]
+min_enrichment = args["min_enrichment"]
 
 from scipy.stats import norm
 min_z = norm.ppf(1 - max_p)
@@ -117,6 +118,7 @@ def extend_df(df, kwargs):
 
 if __name__ == "__main__":
 
+    from collections import defaultdict
     import pyranges as pr
     import pandas as pd
     import numpy as np
@@ -161,33 +163,26 @@ if __name__ == "__main__":
         return r
 
 
-    def find_peaks(rle, rle_b, ratio, chromosome, strand):
-
-        rle_shift_left = rle.copy()
+    def find_peaks(rle, left, right, rle_b, ratio, chromosome, strand):
 
         #TODO: fix shift. If flank_distance > runs[0], this fails
         # but for now other stuff is more important
-        assert rle_shift_left.runs[0] >= flank_distance
-        rle_shift_left.runs[0] -= flank_distance
+        assert left.runs[0] >= flank_distance
 
-        eq5_numerator = rle - rle_shift_left
+        eq5_numerator = rle - left
 
-        rle_shift_right = rle.copy()
-
-        rle_shift_right.runs[0] += flank_distance
-
-        eq6_numerator = rle - rle_shift_right
+        eq6_numerator = rle - right
 
         eq4_numerator = eq5_numerator + eq6_numerator
 
-        eq4_denominator = make_denominator(2 * (rle + rle_shift_right + rle_shift_left))
+        eq4_denominator = make_denominator(2 * (rle + right + left))
 
         z1 = (eq4_numerator / eq4_denominator).apply_values(nan_and_inf_to_0)
 
-        eq5_denominator = make_denominator(rle + rle_shift_left)
+        eq5_denominator = make_denominator(rle + left)
         z2 = (eq5_numerator / eq5_denominator).apply_values(nan_and_inf_to_0)
 
-        eq6_denominator = make_denominator(rle + rle_shift_right)
+        eq6_denominator = make_denominator(rle + right)
         z3 = (eq6_numerator / eq6_denominator).apply_values(nan_and_inf_to_0)
 
         eq8_numerator = ((ratios[strand] * rle) - rle_b)
@@ -211,55 +206,90 @@ if __name__ == "__main__":
         peaks1, peaks2, peaks3 = z1[peaks1], z2[peaks2], z3[peaks3]
         peaks1.Type, peaks2.Type, peaks3.Type = 1, 2, 3
 
-        return pr.concat([peaks1, peaks2, peaks3])
+        return peaks1, peaks2, peaks3
 
-    # outdict = {}
+    all_peaks = defaultdict(dict)
     for chromosome in gr.chromosomes:
 
         if not (len(gr[chromosome, "+"]) > 0 and len(gr[chromosome, "-"]) > 0):
             print(chromosome + " does not contain data from both strands.")
             continue
 
-        ps = {}
         for strand in "+-":
             _gr = gr[chromosome, strand]
             _grb = grb[chromosome, strand]
             rle = _gr.to_rle(strand=True)[chromosome, strand]
             rle_b = _grb.to_rle(strand=True)[chromosome, strand]
 
+            left = rle.shift(-flank_distance)
+            right = rle.shift(flank_distance)
+
             ratio = ratios[strand]
-            peaks = find_peaks(rle, rle_b, ratio, chromosome, strand)
+            peaks1, peaks2, peaks3 = find_peaks(rle, left, right, rle_b, ratio, chromosome, strand)
 
-            max_z = lambda df: df.groupby(["Chromosome", "Start", "End", "Strand", "Type"], observed=True, as_index=False).Value.max()
-            peaks = peaks.apply(max_z)
-            peaks.NLP = np.around(-(pnorm(peaks.Value)/np.log(10)), 3)
-            peaks.Location = np.ceil((peaks.Start + peaks.End)/2).astype(int)
-            peaks = peaks.drop("Value")
-            cvg = rle[peaks.Location]
-            bg = rle_b[peaks.Location]
-            peaks.Enrichment = ((ratio * cvg) + 1) / (bg + 1)
-            # e = pd.Series(enrichment)
-            # print(e.median())
-            # print(e.min())
-            # print(e.max())
-            # print(e.mean())
-            # print(list(rle_b[peaks.Location]))
-            # ps[strand] = peaks
+            for peaks in [peaks1, peaks2, peaks3]:
+                max_z = lambda df: df.groupby(["Chromosome", "Start", "End", "Strand", "Type"], observed=True, as_index=False).Value.max()
+                peaks = peaks.apply(max_z)
+                peaks.NLP = np.around(-(pnorm(peaks.Value)/np.log(10)), 3)
+                peaks.Location = np.ceil((peaks.Start + peaks.End)/2).astype(int)
+                peaks = peaks.drop("Value")
+                cvg = rle[peaks.Location]
+                bg_cvg = rle_b[peaks.Location]
+                peaks.Enrichment = ((ratio * cvg) + 1) / (bg_cvg + 1)
 
-        # ps["+"].intersect(ps["-"])
+                cvg_left = left[peaks.Location]
+                cvg_right = right[peaks.Location]
 
-        # fotir k, rle in rles:
+                peaks.SURL = cvg_left
+                peaks.SURR = cvg_right
+                peaks.CVG = cvg
 
-    # peaks
-    # groupby on interval, find max zscore
-    #    pvalue: pnorm(max_z)/np.log10
-    #    these are peak.NLP
-    #    peak_loc is just start + end / 2
-    #    need the enrichment there with ((ratio*chip_cvg) + 1) / (bg_cvg + 1)
-    #    also need coverage at peak loc, left and right
-    #    enrichment: 
+                all_peaks[peaks.head(1).Type.iloc[0]][chromosome, strand] = peaks.df
 
 
+    all_peaks2 = []
+
+    for peak_type, peak_dict in all_peaks.items():
+        gr = pr.PyRanges(peak_dict)
+        gr.ID = np.arange(len(gr))
+        stranded_grs = {}
+        for strand in "+-":
+            _gr = gr[strand]
+            cutoff = np.percentile(_gr.Enrichment, min_enrichment * 100)
+            _gr = _gr.subset(lambda df: df.Enrichment > cutoff)
+            # _gr = _gr.drop("Enrichment")
+            stranded_grs[strand] = _gr[["Enrichment", "ID"]]
+
+        j = stranded_grs["+"].join(stranded_grs["-"]).new_position("union").drop(like="Start_|End_|Strand").unstrand()
+        # print("******" * 10)
+        # print(j)
+        # print(j.ID.value_counts())
+        # print(j.ID_b.value_counts())
+        j = j.apply(lambda df: df.reindex(df.groupby(["ID"], observed=True, as_index=False).Enrichment.idxmax()))
+        j = j.apply(lambda df: df.reindex(df.groupby(["ID_b"], observed=True, as_index=False).Enrichment_b.idxmax()))
+        # print(j.ID.value_counts())
+        # print(j.ID_b.value_counts())
+        # print(j)
+
+        # e_cols = ["Enrichment", "Enrichment_b"]
+        # print(j)
+        # j = j.apply(lambda df: df.sort_values(e_cols))
+        # j = j.apply(lambda df: df.drop_duplicates(e_cols, keep="last"))
+        # print(j.msp())
+        # print(j)
+        # print(best_enrichment)
+        # print(j)
+            # all_peaks2.append(_gr)
+
+    peaks = pr.concat(all_peaks2)
+
+    # print(peaks.Type.value_counts())
+
+    # p = peaks.drop()
+    # p.join(p, strandedness="opposite")
+
+
+        # print(_gr.msp())
     # true peaks:
         # find peaks that overlap on forward and reverse strand
         # join strandedness reverse then new pos union
