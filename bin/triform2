@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import sys
 import argparse
 import pandas as pd
 import numpy as np
@@ -36,6 +37,18 @@ parser.add_argument(
     type=str,
     nargs='+',
     help='''Control (input) file(s) in bam/bed/bed.gz/bed.bz2 format.''')
+
+
+parser.add_argument(
+    '--false-discovery-rate',
+    '-fdr',
+    required=False,
+    default=0.05,
+    type=float,
+    help=
+    '''Remove all peaks with an FDR above cutoff. Default 0.05.''')
+
+
 
 parser.add_argument(
     '--read-width',
@@ -94,12 +107,13 @@ parser.add_argument(
     '''[Advanced] Minimum inter-strand shift (lag) between peak coverage distributions (default 10 bp).''')
 
 args = vars(parser.parse_args())
-gr = pr.PyRanges(pd.read_parquet(args["treatment"][0]))
+# gr = pr.PyRanges(pd.read_parquet(args["treatment"][0]))
 
 
 flank_distance = args["flank_distance"]
 read_width = args["read_width"]
 
+fdr = args["false_discovery_rate"]
 max_p = args["max_p"]
 min_width = args["min_width"]
 min_shift = args["min_shift"]
@@ -107,6 +121,66 @@ min_enrichment = args["min_enrichment"]
 
 from scipy.stats import norm
 min_z = norm.ppf(1 - max_p)
+
+
+def read_files(files):
+    cvg = PyRles()
+    lengths = {}
+
+    for f in files:
+        print("Reading", f, file=sys.stderr)
+        if f.endswith(".bed") or f.endswith(".bed.gz"):
+            df = pd.read_table(f, header=None, usecols=[0, 1, 2, 5], dtype={0: "category", 1: np.int32, 2: np.int32, 5: "category"}, nrows=None)
+            df.columns = "Chromosome Start End Strand".split()
+        elif f.endswith(".pq"):
+            df = pd.read_parquet(f)
+        elif f.endswith(".bam"):
+            df = pr.read_bam(output_df=True)
+
+        gr = pr.PyRanges(df)
+
+        lengths["+"] = len(gr["+"])
+        lengths["-"] = len(gr["-"])
+
+        cvg = gr.apply(extend_df, read_width=read_width).to_rle()
+
+    return cvg, lengths
+
+
+def compute_fdr(df, fdr):
+
+    print("Using an FDR of {}.".format(fdr), file=sys.stderr)
+
+    df = df.sort_values("NLP", ascending=False)
+
+    unique_nlp = df.NLP.drop_duplicates()
+
+    sizes = unique_nlp.apply(lambda x: (df.NLP == x).sum())
+    indices = unique_nlp.apply(lambda x: (df.NLP >= x).sum())
+
+    nlrs = []
+    for nlp, j in zip(unique_nlp, indices):
+        m = sum(df.MAX_NLP >= nlp)
+        by = np.log10(1/sum(range(1, m + 1)))
+        nls = nlp + np.log10(j/m)
+        nlrs.append(max(nls - by, 0))
+
+    nlqs = [max(nlrs[i:]) for i in range(len(nlrs))]
+
+    nlqss = np.repeat(nlqs, sizes)
+
+    qvals = 10 ** -nlqss
+
+    df.insert(df.shape[1], "QVAL", qvals)
+
+    n_total = len(df)
+    df = df[df.QVAL <= fdr]
+
+    n_passed = (df.QVAL <= fdr).sum()
+
+    print("{} of {} peaks passed the FDR cutoff.".format(n_passed, n_total), file=sys.stderr)
+
+    return pr.PyRanges(df)
 
 
 def ccf(x, y, lag_max = 100):
@@ -126,7 +200,6 @@ def compute_lag(n, p):
 def compute_lags(peaks, cvg):
 
     lags = []
-    # do in parallel?
     for k in peaks.chromosomes:
         df = peaks[k].df
         df = df["Start End".split()]
@@ -137,6 +210,7 @@ def compute_lags(peaks, cvg):
         pv = np.repeat(p.Value, p.Run).values
         pi = np.repeat(p.ID, p.Run).values
         nv = np.repeat(n.Value, n.Run).values
+
         df = pd.DataFrame({"ID": pi, "PV": pv, "NV": nv})
         lags.extend(df.groupby("ID").apply(lambda df: compute_lag(df.NV, df.PV)).values)
 
@@ -144,20 +218,15 @@ def compute_lags(peaks, cvg):
 
 
 def extend_df(df, kwargs):
-
-    df = df.copy()
     read_width = kwargs["read_width"]
+
+
     width = df.End - df.Start
     gaps = np.array(np.floor((read_width - width) / 2), dtype=np.long)
     df.Start = df.Start - gaps - 1
     df.End = df.Start + width + (2 * gaps)
 
     return df
-
-
-# gr = gr.apply(extend_df)
-# rles = gr.to_rle(strand=True)
-
 
 
 
@@ -170,14 +239,19 @@ if __name__ == "__main__":
     read_width = 100
     flank_distance = 150
 
-    gr = pr.PyRanges(pd.read_parquet("example_data/srf_huds_Gm12878_rep1.pq")).drop_duplicate_positions()
-    grb = pr.PyRanges(pd.read_parquet("example_data/backgr_huds_Gm12878_rep1.pq")).drop_duplicate_positions()
+    from time import time
+    start = time()
+    chip_rles, chip_length = read_files(args["treatment"])
+    end = time()
+    print("took", end - start)
+    start = time()
+    background_rles, background_length = read_files(args["control"])
+    end = time()
+    print("took", end - start)
 
-    gr = gr.apply(extend_df, read_width = read_width)
-    grb = grb.apply(extend_df, read_width = read_width)
 
-    ratios = {"+": len(grb["+"]) / len(gr["+"]),
-              "-": len(grb["-"]) / len(gr["-"])}
+    ratios = {"+": background_length["+"] / chip_length["+"],
+              "-":background_length["-"] / chip_length["-"]}
 
     nan_and_inf_to_0 = lambda x: np.nan_to_num(x, posinf=0, neginf=0)
     def above_cutoff_to_ranges(r, c, k):
@@ -199,11 +273,13 @@ if __name__ == "__main__":
 
     def pnorm(max_z):
 
-        np.seterr(divide="ignore")
-        r = np.log(1 - norm.cdf(max_z))
-        np.seterr(divide="warn")
+        r = -np.log(norm.sf(max_z))/np.log(10)
 
         return r
+
+    def _zscores(x, y, r=1):
+        diff = (r * x) - y
+        return diff/np.sqrt(r * (x + y))
 
 
     def find_peaks(rle, left, right, rle_b, ratio, chromosome, strand):
@@ -224,7 +300,8 @@ if __name__ == "__main__":
         eq6_denominator = make_denominator(rle + right)
         z3 = (eq6_numerator / eq6_denominator).apply_values(nan_and_inf_to_0)
 
-        eq8_numerator = ((ratios[strand] * rle) - rle_b)
+        _tmp = ratios[strand] * rle
+        eq8_numerator = (_tmp - rle_b)
         eq8_denominator = make_denominator(ratios[strand] * (rle_b + rle))
         z4 = (eq8_numerator / eq8_denominator).apply_values(nan_and_inf_to_0)
 
@@ -249,18 +326,16 @@ if __name__ == "__main__":
 
     all_peaks = defaultdict(dict)
     lag_cvg = dict()
-    for chromosome in gr.chromosomes:
+    chromosomes = chip_rles.chromosomes
+    for chromosome in chromosomes:
 
-        if not (len(gr[chromosome, "+"]) > 0 and len(gr[chromosome, "-"]) > 0):
-            print(chromosome + " does not contain data from both strands.")
-            continue
+        print(chromosome, file=sys.stderr)
 
         for strand in "+-":
-            _gr = gr[chromosome, strand]
-            _grb = grb[chromosome, strand]
-            rle = _gr.to_rle(strand=True)[chromosome, strand]
-            rle_b = _grb.to_rle(strand=True)[chromosome, strand]
+            rle = chip_rles[chromosome, strand]
 
+            rle_b = background_rles[chromosome, strand]
+            s = pd.Series(rle_b.values)
             left = rle.shift(-flank_distance)
             right = rle.shift(flank_distance)
 
@@ -268,9 +343,13 @@ if __name__ == "__main__":
             peaks1, peaks2, peaks3 = find_peaks(rle, left, right, rle_b, ratio, chromosome, strand)
 
             for peaks in [peaks1, peaks2, peaks3]:
+                if not len(peaks):
+                    continue
+
                 max_z = lambda df: df.groupby(["Chromosome", "Start", "End", "Strand", "Type"], observed=True, as_index=False).Value.max()
                 peaks = peaks.apply(max_z).apply(lambda df: df.astype({"Start": np.int32, "End": np.int32}))
-                peaks.NLP = np.around(-(pnorm(peaks.Value)/np.log(10)), 3)
+
+                peaks.NLP = np.around((pnorm(peaks.Value)), 3)
                 peaks.Location = np.ceil((peaks.Start + peaks.End)/2).astype(int)
                 peaks = peaks.drop("Value")
                 cvg = rle[peaks.Location]
@@ -287,19 +366,15 @@ if __name__ == "__main__":
                 peak_type = peaks.head(1).Type.iloc[0]
                 all_peaks[peak_type][chromosome, strand] = peaks.df
 
-            mult = pr.concat([p.drop() for p in [peaks1, peaks2, peaks3]]).slack(flank_distance).merge().to_rle()[chromosome, strand]
+            mult = pr.concat([p["Chromosome Start End".split()] for p in [peaks1, peaks2, peaks3]]).slack(flank_distance).merge().to_rle()[chromosome, strand]
             lag_cvg[chromosome, strand] = rle * mult
-            # lag_cvg[chromosome, strand] = subsetted.df
 
     lag_cvg = PyRles(lag_cvg)
-    # print(lag_cvg)
-    all_peaks2 = []
-    # enrichments = defaultdict(list)
+    lag_cvg = lag_cvg.make_strands_same_length()
+    peaks = defaultdict(lambda: pr.PyRanges())
 
     for peak_type, peak_dict in all_peaks.items():
-        # print([df.Start.dtype for df in peak_dict.values()])
         gr = pr.PyRanges(peak_dict)
-        # print(gr)
         gr.ID = np.arange(len(gr))
         stranded_grs = {}
         for strand in "+-":
@@ -320,69 +395,49 @@ if __name__ == "__main__":
         elif peak_type == 3:
             j.End += flank_distance
 
-
+        # j.to_csv(str(peak_type) + "_peak_type.tsv", sep="\t")
         j.Lag = compute_lags(j, lag_cvg)
         j = j.subset(lambda df: df.Lag > min_shift)
         p = gr["+"]
         n = gr["-"]
         p = p[p.ID.isin(j.ID)]
         n = n[n["-"].ID.isin(j.ID_b)]
+        new_starts = np.maximum(p.Start.values, n.Start.values) 
         new_ends = np.minimum(p.End.values, n.End.values) 
         out = pr.PyRanges(chromosomes=p.Chromosome, starts=new_starts, ends=new_ends)
-        out.CVG = p.CVG.values + n.CVG.values
-        out.SURL = p.SURL.values + n.SURL.values
-        out.SURR = p.SURR.values + n.SURR.values
+        cvg = p.CVG.values + n.CVG.values
+        surl = p.SURL.values + n.SURL.values
+        surr = p.SURR.values + n.SURR.values
+
+        if peak_type == 1:
+            zs = _zscores(cvg, surl + surr, 2)
+            max_zs = _zscores(cvg + surl + surr, 0, 2)
+        elif peak_type == 2:
+            zs = _zscores(cvg, surl)
+            max_zs = _zscores(cvg + surl, 0)
+        elif peak_type == 3:
+            zs = _zscores(cvg, surr)
+            max_zs = _zscores(cvg + surr, 0)
+
+        peak_nlp = pnorm(zs)
+        max_nlp = pnorm(max_zs)
+
+        out.CVG = cvg
+        out.SURL = surl
+        out.SURR = surr
         out.Loc = (np.round((p.Location.values + n.Location.values)/2)).astype(int)
         out.Type = p.Type.values
-        all_peaks.append(out)
 
+        out.NLP = peak_nlp
+        out.MAX_NLP = max_nlp
 
-        # def _zscores(x, y, r=1):
+        peaks[peak_type] = out
 
-        #     diff = (r * x) - y
-        #     zs = diff/np.sqrt(r * (x + y))
+    # remove overlapping
+    peaks[2] = peaks[2].overlap(peaks[1], invert=True)
+    peaks[3] = peaks[3].overlap(peaks[1], invert=True)
+    peaks[3] = peaks[3].overlap(peaks[2], invert=True)
 
-        #     return zs
-        # if peak_type == 1:
-        #     zs = _zscores(_cvg, surl + surr, 2)
-        #     max_zs = _zscores(_cvg + surl + surr, 0, 2)
-        # elif peak_type == 2:
-        #     zs = _zscores(_cvg, surl)
-        #     max_zs = _zscores(_cvg + surl, 0)
-        # elif peak_type == 3:
-        #     zs = _zscores(_cvg, surr)
-        #     max_zs = _zscores(_cvg + surr, 0)
+    result = pr.concat(list(peaks.values()))
 
-        # print(good_plus)
-        # print(good_neg)
-        # print("-----" * 5)
-        # print(j)
-        # r = gr.overlap(j)
-        # print(r)
-
-    # peaks = pr.concat(all_peaks2)
-    # print(peaks)
-
-    # print(peaks.Type.value_counts())
-
-    # p = peaks.drop()
-    # p.join(p, strandedness="opposite")
-
-
-        # print(_gr.msp())
-    # true peaks:
-        # find peaks that overlap on forward and reverse strand
-        # join strandedness reverse then new pos union
-
-        # then add flank_distance to peaks
-        # if peak_type == 1:
-        #     new_peaks.Start -= flank_distance
-        #     new_peaks.End += flank_distance
-        # elif peak_type == 2:
-        #     new_peaks.Start -= flank_distance
-        # elif peak_type == 3:
-        #     new_peaks.End += flank_distance
-
-        # then compute their lags with sum_cvg 
-        # then their lags
-
+    print(compute_fdr(result.df, fdr))
