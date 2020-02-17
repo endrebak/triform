@@ -146,6 +146,31 @@ def read_files(files):
 
     return cvg, lengths
 
+def read_files_no_pyranges(files):
+    cvg = PyRles()
+    lengths = {}
+
+    for f in files:
+        print("Reading", f, file=sys.stderr)
+        if f.endswith(".bed") or f.endswith(".bed.gz"):
+            df = pd.read_table(f, header=None, usecols=[0, 1, 2, 5], dtype={0: "category", 1: np.int32, 2: np.int32, 5: "category"}, nrows=None)
+            df.columns = "Chromosome Start End Strand".split()
+        elif f.endswith(".pq"):
+            df = pd.read_parquet(f)
+        elif f.endswith(".bam"):
+            df = pr.read_bam(output_df=True)
+
+        for (c, s), gdf in df.groupby("Chromosome Strand".split()):
+            gr = pr.PyRanges(gdf).apply(extend_df, read_width=read_width)
+            lengths[s] += len(gr)
+
+        gr = pr.PyRanges(df)
+
+
+        # cvg = gr.apply(extend_df, read_width=read_width).to_rle()
+
+    return cvg, lengths
+
 
 def compute_fdr(df, fdr):
 
@@ -249,7 +274,6 @@ if __name__ == "__main__":
     end = time()
     print("took", end - start)
 
-
     ratios = {"+": background_length["+"] / chip_length["+"],
               "-":background_length["-"] / chip_length["-"]}
 
@@ -328,9 +352,11 @@ if __name__ == "__main__":
     lag_cvg = dict()
     chromosomes = chip_rles.chromosomes
     for chromosome in chromosomes:
+    # for chromosome in ["chr1"]:
 
         print(chromosome, file=sys.stderr)
 
+        start = time()
         for strand in "+-":
             rle = chip_rles[chromosome, strand]
 
@@ -366,8 +392,12 @@ if __name__ == "__main__":
                 peak_type = peaks.head(1).Type.iloc[0]
                 all_peaks[peak_type][chromosome, strand] = peaks.df
 
+
             mult = pr.concat([p["Chromosome Start End".split()] for p in [peaks1, peaks2, peaks3]]).slack(flank_distance).merge().to_rle()[chromosome, strand]
             lag_cvg[chromosome, strand] = rle * mult
+
+
+        print(time() - start, file=sys.stderr)
 
     lag_cvg = PyRles(lag_cvg)
     lag_cvg = lag_cvg.make_strands_same_length()
@@ -396,7 +426,9 @@ if __name__ == "__main__":
             j.End += flank_distance
 
         # j.to_csv(str(peak_type) + "_peak_type.tsv", sep="\t")
+        print("computing lag")
         j.Lag = compute_lags(j, lag_cvg)
+        print("done computing lag")
         j = j.subset(lambda df: df.Lag > min_shift)
         p = gr["+"]
         n = gr["-"]
